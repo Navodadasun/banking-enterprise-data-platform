@@ -42,9 +42,9 @@ The batch-ingestion extension is integrated at the project root. It extracts the
 Start PostgreSQL first so its `banking-platform-net` network exists, then run these commands from the project root:
 
 ```powershell
-docker compose -f infrastructure/docker/compose.storage.yaml config
-docker compose -f infrastructure/docker/compose.storage.yaml up -d
-docker compose -f infrastructure/docker/compose.storage.yaml ps
+docker compose --project-directory . -f infrastructure/docker/compose.storage.yaml config
+docker compose --project-directory . -f infrastructure/docker/compose.storage.yaml up -d
+docker compose --project-directory . -f infrastructure/docker/compose.storage.yaml ps
 .\.venv\Scripts\python.exe -m pip install -r data-ingestion/batch/requirements.txt
 .\.venv\Scripts\python.exe data-ingestion/batch/ingest.py --source all --chunk-size 5000
 .\.venv\Scripts\python.exe data-ingestion/batch/verify_lake.py
@@ -57,14 +57,128 @@ The client and SeaweedFS S3 identity use `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SEC
 
 `runtime\ingestion_state.sqlite3` stores the transaction high-water checkpoint and `runtime\batch_runs.jsonl` stores status, batch IDs, timestamps, row counts, and manifests. Both are ignored by Git and must be preserved for incremental continuity. Snapshot sources are re-ingested on each run; transactions are incremental by `transaction_id`. Run the ingestion command twice to confirm that the second transaction manifest reports zero new rows. The verifier checks the Parquet objects against the manifests and current PostgreSQL counts and detects duplicate transaction IDs across recorded batches.
 
-### Integration verification (November 12, 2026)
+### Live runtime verification (November 12, 2026)
 
-- The add-on had been extracted under `bedp-batch-ingestion-addon\`; the project-root Compose and ingestion paths did not exist. The destinations were checked for conflicts, then the Compose file, ingestion code, and batch documentation were moved to the root layout.
-- The initial image pull failed once with Docker reporting a DNS lookup failure for `production.cloudfront.docker.com`. On diagnosis, Windows resolved both that host and `registry-1.docker.io`, WSL 2 resolved the Docker Registry and reached it over HTTPS, and Docker Desktop reported its built-in proxy (`http.docker.internal:3128`). A later `docker pull chrislusf/seaweedfs:3.80` succeeded without changing system DNS, WSL settings, or proxy settings. No system-level network changes were made. WSL emitted a PATH translation warning for `E:\msys64\ucrt64\bin`; it did not prevent name resolution or registry access.
-- SeaweedFS `3.80` is running and healthy on the existing `banking-platform-net`, with persistent volume `banking-enterprise-data-platform_seaweedfs_data`, a 1 GiB memory limit, and localhost-only ports. The master UI returned HTTP 200; an unsigned S3 request returned HTTP 403; signed requests with the configured `.env` identity succeeded and created/checked the `banking-lakehouse` bucket.
-- The existing PostgreSQL container remained healthy throughout. Its `banking-enterprise-data-platform_postgres_data` volume was retained. Source counts verified before/after ingestion: customers 100,000; accounts 100,000; cards 100,000; loans 100,000; branches 5; transactions 3,814.
-- The first `--source all --chunk-size 5000` run wrote six successful manifests and 403,819 rows to Parquet: 100,000 each from customers, accounts, cards, and loans; 3,814 transactions; and 5 branches. The verifier checked each Parquet object's batch metadata, ingestion timestamp, row count, manifest reference, and source counts.
-- The second run wrote another five snapshots and an incremental transaction manifest with 0 rows. The final verification passed across 12 manifests; all 3,814 transaction IDs were unique, and the run log contained 12 successes and no failures.
+The lakehouse was started and exercised against the existing PostgreSQL and SeaweedFS data without rerunning ingestion or regenerating synthetic records. Docker Desktop's Linux engine and both WSL 2 distributions were running. PostgreSQL and SeaweedFS reported healthy; their named data volumes were left intact. The non-empty S3 access and secret values in the ignored root `.env` matched the running SeaweedFS identity; no credential values were printed.
+
+Bronze verification passed against 12 existing manifests and Parquet objects. PostgreSQL and Bronze counts matched: customers 100,000; accounts 100,000; transactions 3,814; cards 100,000; loans 100,000; branches 5. All 3,814 transaction IDs were unique across the incremental manifests.
+
+The pinned Spark 3.5.3 / Iceberg 1.6.0 / Nessie 0.92.1 / Hadoop S3A 3.3.4 dependencies resolved from Maven Central. Two end-to-end Spark runs completed and published to Nessie `main`. The first run took 168.8 seconds and the idempotency rerun took 359.9 seconds. Both reported zero duplicate rows dropped and zero quarantined rows; all six Silver row counts and five Gold row counts were unchanged after the rerun.
+
+| Published table | Rows after rerun |
+|---|---:|
+| `nessie.silver.customers` | 100,000 |
+| `nessie.silver.accounts` | 100,000 |
+| `nessie.silver.transactions` | 3,814 |
+| `nessie.silver.cards` | 100,000 |
+| `nessie.silver.loans` | 100,000 |
+| `nessie.silver.branches` | 5 |
+| `nessie.silver.quarantine_records` | 0 |
+| `nessie.gold.daily_transactions` | 10 |
+| `nessie.gold.branch_performance` | 5 |
+| `nessie.gold.customer_accounts` | 100,000 |
+| `nessie.gold.loan_portfolio` | 1 |
+| `nessie.gold.monthly_kpis` | 1 |
+
+The latest `daily_transactions` Iceberg snapshot after the rerun was committed at `2026-11-12 05:23:36 UTC`, snapshot ID `8893050378360794250`, operation `append`, with 10 added/total records. The Gold sample query returned 10 rows. For example, on `2026-11-11`, Jaffna City withdrawals had 413 transactions totaling `1060767.00`, net `-1060767.00`; Kandy City withdrawals had 400 totaling `1017428.00`, net `-1017428.00`.
+
+The Docker engine reported 7.61 GiB available to Linux containers (16 CPUs), despite the host's 16 GB RAM. The configured Spark cap is 4 GiB / 2 CPUs and Nessie's cap is 768 MiB; observed Spark usage stayed below 2.1 GiB during processing.
+
+## Spark, Iceberg, Nessie lakehouse
+
+The lakehouse runs Spark in local mode with two worker threads; it does not start a multi-node Spark cluster. Apache Spark `3.5.3`, Apache Iceberg `1.6.0` (`iceberg-spark-runtime-3.5_2.12`), Project Nessie `0.92.1` and its Spark 3.5/Scala 2.12 extension, Hadoop S3A `3.3.4`, and the Spark-container boto3 client `1.35.99` are pinned. The Spark/Iceberg/Nessie artifact combination follows the published Nessie Spark 3.5 compatibility matrix for Iceberg 1.6.0.
+
+The existing PostgreSQL, batch ingestion, and SeaweedFS services are not replaced. The lakehouse Compose file joins their existing `banking-platform-net` network and adds Nessie, a small Spark driver, and one-shot volume-permission helpers. Nessie uses its own persistent RocksDB volume; Iceberg data and metadata files are stored in the existing SeaweedFS bucket under `warehouse/`. Spark code is mounted read-only, and its Maven cache and structured run log use separate persistent volumes. Do not use `docker compose down -v`; it deletes persistent data.
+
+Before building the lakehouse, confirm the root `.env` contains non-empty `S3_ACCESS_KEY` and `S3_SECRET_KEY` values that match the existing SeaweedFS S3 identity. If either is missing, add it with `notepad .env`; do not put credentials in scripts or commit them.
+
+Run these commands from the repository root in PowerShell. Keep the existing `.env` and ingestion checkpoint. Check that Docker Desktop's Linux engine and WSL 2 are available:
+
+```powershell
+docker info
+docker context ls
+wsl --status
+wsl -l -v
+```
+
+Check and start the existing source/storage containers. If they already exist but are stopped, `docker start` avoids recreating them; do not remove their named volumes:
+
+```powershell
+docker ps -a
+docker start bedp-postgres bedp-seaweedfs
+docker inspect --format 'status={{.State.Status}} health={{.State.Health.Status}}' bedp-postgres
+docker inspect --format 'status={{.State.Status}} health={{.State.Health.Status}}' bedp-seaweedfs
+```
+
+For a first-time setup where those containers do not yet exist, Compose creates them with the existing named volumes:
+
+```powershell
+docker compose --project-directory . -f infrastructure/docker/compose.yaml up -d
+docker compose --project-directory . -f infrastructure/docker/compose.storage.yaml up -d
+docker compose --project-directory . -f infrastructure/docker/compose.yaml ps
+docker compose --project-directory . -f infrastructure/docker/compose.storage.yaml ps
+```
+
+Check the source counts and Bronze data using the existing verifier. Do not run ingestion if the existing manifests and Parquet objects verify:
+
+```powershell
+docker exec bedp-postgres pg_isready -U bedp_admin -d postgres
+.\.venv\Scripts\python.exe data-ingestion\batch\verify_lake.py
+```
+
+For a new or empty Bronze lake only, use the existing ingestion flow; it does not delete source records or existing SeaweedFS data:
+
+```powershell
+.\.venv\Scripts\python.exe data-ingestion\batch\ingest.py --source all --chunk-size 5000
+.\.venv\Scripts\python.exe data-ingestion\batch\verify_lake.py
+```
+
+Build and start the lakehouse services, then process Bronze:
+
+```powershell
+docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml config
+docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml up -d --build
+docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml ps
+.\scripts\run-lakehouse.ps1 -RunId demo-001
+.\scripts\verify-lakehouse.ps1
+.\scripts\run-lakehouse-sql.ps1
+```
+
+The first Spark submission downloads the pinned Maven artifacts, so it requires network access to Maven Central. Omit `-RunId` to generate a unique run ID automatically. Reuse an existing source/storage data volume; these commands don't generate synthetic data. Each run selects the latest completed manifest for the five full-snapshot sources and reads all completed transaction manifests. Schema/null/domain checks and referential checks run before a Silver table is written; invalid records are saved to `nessie.silver.quarantine_records`. Duplicate primary keys are counted and deterministically reduced to the latest Bronze ingestion. Snapshot tables are atomically replaced on a temporary Nessie branch, and transactions are merged by `transaction_id`, making transaction replays idempotent.
+
+The pipeline initializes the empty `silver` and `gold` namespaces on Nessie `main` before creating its run branch; this gives a brand-new Nessie catalog a merge base. All six Silver tables and five Gold analytics tables are staged on the run-specific branch. The branch is merged into `main` only after every input, quality check, Silver write, and Gold aggregate succeeds; a failed run leaves published tables unchanged. Nessie checks the original `main` hash during publish to reject a concurrent conflicting run. Structured JSON events include run IDs, counts, durations, and failure types without record values or credentials. Detailed counts, quarantine results, Iceberg snapshot metadata, and a sample Gold query are available from the Python and SQL verification scripts.
+
+The Spark service is limited to 4 GiB and 2 CPUs and uses `local[2]` with a 3 GiB driver. Nessie is capped at 768 MiB; existing PostgreSQL and SeaweedFS limits are unchanged. Expected resource use is suitable for the 16 GiB development host.
+
+### Lakehouse troubleshooting
+
+- **Docker commands cannot connect:** start Docker Desktop and wait for its Linux engine before running any Compose command. Do not remove or recreate volumes to fix a stopped daemon.
+- **Compose reports that `banking-platform-net` is missing:** start the existing PostgreSQL and SeaweedFS Compose files above. They create/use the network without deleting their volumes.
+- **Spark reports it cannot resolve Nessie or SeaweedFS:** check that `bedp-nessie` is healthy and the existing `bedp-seaweedfs` container is running on `banking-platform-net`; keep the service endpoints in Compose rather than changing them to `localhost`.
+- **Nessie does not become healthy:** inspect `docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml logs nessie`. The local catalog uses a persistent RocksDB volume; do not delete that volume when troubleshooting.
+- **Spark package resolution fails:** confirm outbound Maven Central connectivity, then rerun the submission. The dependency coordinates and versions are pinned in the scripts; do not substitute versions independently.
+- **Bronze decimal fields fail validation:** keep the existing ingestion output unchanged. Decimal values are serialized as strings in Bronze Parquet and cast to decimal by the Silver job.
+- **No completed Bronze manifests or missing Parquet objects:** run `data-ingestion\batch\verify_lake.py` after confirming PostgreSQL and SeaweedFS are healthy. A transformation intentionally fails before publish if a manifest is absent, malformed, or references missing objects.
+- **A run fails:** inspect the JSON failure event emitted by `run-lakehouse.ps1`, then check `docker compose ... logs nessie` and the Spark command output. Failed run branches are not merged; a failed branch cleanup is explicitly reported as `CLEANUP_WARNING`.
+- **Credentials:** set the S3 access/secret keys only in the ignored root `.env`; do not pass them as script arguments or add them to source control. The local sample defaults are for development only.
+
+### Safe shutdown and recovery
+
+Stop only the lakehouse containers when you want to free resources; this retains Nessie, Maven-cache, and runtime-log volumes:
+
+```powershell
+docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml stop spark nessie
+```
+
+Resume the services and rerun the verification without rebuilding:
+
+```powershell
+docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml up -d
+docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml ps
+.\scripts\verify-lakehouse.ps1
+```
+
+If PostgreSQL or SeaweedFS is stopped, start the existing containers with `docker start bedp-postgres bedp-seaweedfs` before Spark. For diagnosis, use `docker compose --project-directory . -f infrastructure/docker/compose.lakehouse.yaml logs --tail 100 nessie spark` and inspect `runtime\lakehouse_runs.jsonl`. Never use `docker compose down -v`, `docker volume rm`, or Docker prune commands for routine recovery; they can delete the source data or Iceberg/Nessie state.
 
 ## Architecture and caveats
 - `core_banking`: accounts and balances
@@ -77,4 +191,4 @@ The client and SeaweedFS S3 identity use `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SEC
 The simulator writes account updates and payment events to different databases. These writes are **not atomic across databases**; failure between them can leave discrepancies. A production-grade system needs a transactional outbox, reconciliation, idempotency, and appropriate financial ledger controls. No external ports are exposed beyond localhost. Credentials are local development credentials, not production secrets. No TLS, RBAC hardening, encryption-at-rest policy, audit trail, backup automation, or CDC connector is implemented yet. Logical WAL is enabled to prepare for later CDC.
 
 ## Future modules
-Add Iceberg catalog, processing, governance, analytics and observability to this **same** repository. Avoid putting phase numbers in source file names.
+The Spark/Iceberg/Nessie catalog, Silver/Gold processing, and baseline runtime verification are implemented in this **same** repository. Governance, automated backup/retention, CDC, Kafka, and Airflow remain future work; avoid adding them until the lakehouse operational requirements are defined and tested. Avoid putting phase numbers in source file names.

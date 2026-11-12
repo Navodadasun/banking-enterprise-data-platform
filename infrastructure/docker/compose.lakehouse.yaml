@@ -1,0 +1,94 @@
+name: banking-enterprise-data-platform
+services:
+  nessie-data-init:
+    image: busybox:1.36.1
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 185:0 /nessie-data"]
+    restart: "no"
+    volumes:
+      - nessie_data:/nessie-data
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.92.1
+    container_name: bedp-nessie
+    restart: unless-stopped
+    environment:
+      NESSIE_VERSION_STORE_TYPE: ROCKSDB
+      NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /nessie/data
+      NESSIE_SERVER_DEFAULT_BRANCH: main
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx512m
+    ports:
+      - "127.0.0.1:19120:19120"
+    volumes:
+      - nessie_data:/nessie/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:19120/api/v2/config > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 768m
+    cpus: 1.0
+    depends_on:
+      nessie-data-init:
+        condition: service_completed_successfully
+    networks: [banking-platform-net]
+
+  spark-runtime-init:
+    build:
+      context: data-processing/lakehouse
+      dockerfile: Dockerfile
+    user: "root"
+    command: ["bash", "-lc", "chown -R spark:spark /var/lib/bedp-lakehouse /home/spark/.ivy2"]
+    restart: "no"
+    volumes:
+      - spark_runtime_data:/var/lib/bedp-lakehouse
+      - spark_maven_cache:/home/spark/.ivy2
+
+  spark:
+    build:
+      context: data-processing/lakehouse
+      dockerfile: Dockerfile
+    container_name: bedp-spark
+    command: ["bash", "-lc", "sleep infinity"]
+    restart: unless-stopped
+    environment:
+      NESSIE_URI: http://bedp-nessie:19120/api/v2
+      S3_ENDPOINT: http://bedp-seaweedfs:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in the root .env file}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in the root .env file}
+      LAKE_BUCKET: ${LAKE_BUCKET:-banking-lakehouse}
+      SPARK_MASTER: local[2]
+      SPARK_LOCAL_IP: 0.0.0.0
+      PYTHONUNBUFFERED: "1"
+      LAKEHOUSE_LOG_PATH: /var/lib/bedp-lakehouse/lakehouse_runs.jsonl
+    volumes:
+      - .:/opt/project:ro
+      - spark_runtime_data:/var/lib/bedp-lakehouse
+      - spark_maven_cache:/home/spark/.ivy2
+    depends_on:
+      nessie:
+        condition: service_healthy
+      spark-runtime-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/opt/spark/bin/spark-submit", "--version"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+    mem_limit: 4g
+    cpus: 2.0
+    networks: [banking-platform-net]
+
+volumes:
+  nessie_data:
+    name: banking-enterprise-data-platform_nessie_data
+  spark_maven_cache:
+    name: banking-enterprise-data-platform_spark_maven_cache
+  spark_runtime_data:
+    name: banking-enterprise-data-platform_spark_runtime_data
+
+networks:
+  banking-platform-net:
+    external: true
