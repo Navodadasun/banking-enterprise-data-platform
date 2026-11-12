@@ -1,0 +1,35 @@
+name: banking-enterprise-data-platform
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.80
+    container_name: bedp-seaweedfs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        cat > /tmp/seaweedfs-s3.json <<EOF
+        {"identities":[{"name":"local-ingestion","credentials":[{"accessKey":"$${S3_ACCESS_KEY}","secretKey":"$${S3_SECRET_KEY}"}],"actions":["Admin","Read","Write","List"]}]}
+        EOF
+        exec /usr/bin/weed server -dir=/data -s3 -s3.port=8333 -s3.config=/tmp/seaweedfs-s3.json
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-localdev}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-localdev}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8333:8333"
+      - "127.0.0.1:9333:9333"
+    volumes:
+      - seaweedfs_data:/data
+    mem_limit: 1024m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [banking-platform-net]
+volumes:
+  seaweedfs_data:
+networks:
+  banking-platform-net:
+    external: true

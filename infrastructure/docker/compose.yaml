@@ -1,0 +1,30 @@
+name: banking-enterprise-data-platform
+services:
+  postgres:
+    image: postgres:16.6
+    container_name: bedp-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bedp_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: postgres
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5", "-c", "shared_buffers=128MB", "-c", "max_connections=60", "-c", "log_statement=ddl"]
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./source-systems/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 1024m
+    networks: [banking-platform-net]
+volumes:
+  postgres_data:
+networks:
+  banking-platform-net:
+    name: banking-platform-net

@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS cards (
+ card_id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, customer_id BIGINT NOT NULL,
+ card_token TEXT NOT NULL UNIQUE, last_four CHAR(4) NOT NULL,
+ card_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE',
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now());
