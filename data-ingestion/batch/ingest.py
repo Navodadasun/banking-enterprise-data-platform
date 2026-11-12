@@ -17,6 +17,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
+
 ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT / '.env')
 STATE = ROOT / 'runtime' / 'ingestion_state.sqlite3'
@@ -32,6 +33,7 @@ SOURCES = {
 }
 
 def emit(event):
+    # Keep a lightweight audit trail for each batch run so we can trace failures and success metrics.
     LOG.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(event, default=str)
     with LOG.open('a', encoding='utf-8') as f:
@@ -39,12 +41,14 @@ def emit(event):
     print(line, flush=True)
 
 def s3_client():
+    # Point the batch job at the local S3-compatible endpoint used by the lakehouse environment.
     return boto3.client('s3', endpoint_url=os.getenv('S3_ENDPOINT', 'http://127.0.0.1:8333'),
                         aws_access_key_id=os.getenv('S3_ACCESS_KEY', 'localdev'),
                         aws_secret_access_key=os.getenv('S3_SECRET_KEY', 'localdev'),
                         region_name='us-east-1', config=Config(s3={'addressing_style': 'path'}, retries={'max_attempts': 3}))
 
 def ensure_bucket(s3):
+    # Create the landing bucket lazily so local and CI runs can bootstrap without manual setup.
     try:
         s3.head_bucket(Bucket=BUCKET)
     except ClientError as exc:
@@ -53,12 +57,14 @@ def ensure_bucket(s3):
         s3.create_bucket(Bucket=BUCKET)
 
 def db(dbname):
+    # Each source database gets its own connection, which keeps source-specific ingestion isolated and easy to debug.
     return psycopg.connect(host=os.getenv('POSTGRES_HOST', '127.0.0.1'),
                            port=int(os.getenv('POSTGRES_PORT', '5432')),
                            user=os.getenv('POSTGRES_USER', 'bedp_admin'),
                            password=os.environ['POSTGRES_PASSWORD'], dbname=dbname)
 
 def normalize(row):
+    # Convert IDs and numeric values to strings so Arrow and JSON can serialize them consistently.
     return {k: str(v) if isinstance(v, (Decimal, uuid.UUID)) else v for k, v in row.items()}
 
 def run_source(s3, state, source, chunk_size):
