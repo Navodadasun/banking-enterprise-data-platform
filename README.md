@@ -16,7 +16,7 @@ docker exec bedp-spark test -f /opt/project/data-processing/lakehouse/pipeline.p
 
 The lakehouse scripts check that the project is visible before submitting Spark jobs. Never use `docker compose down -v`, `docker system prune --volumes`, or `docker volume rm`; they destroy the banking data, Iceberg warehouse, or Nessie catalog.
 
-PostgreSQL's `/docker-entrypoint-initdb.d` bind mount still references the retired OneDrive path. It is only read when the PostgreSQL data volume is empty, so the running database is unaffected; do not initialise a fresh PostgreSQL volume until that mount is corrected. Recreating PostgreSQL was intentionally out of scope for this migration.
+PostgreSQL's `/docker-entrypoint-initdb.d` mount now resolves to the current project's `source-systems/postgres/init`. The container was recreated on 2026-11-12 using the existing `banking-enterprise-data-platform_postgres_data` volume; all six databases and 403,819 records were verified unchanged. Initialization scripts still run only when that volume is empty. A pre-change cluster backup is stored outside the project at `C:\Projects\bedp-backups`.
 
 ## Requirements
 - Windows 11, Docker Desktop with WSL 2, Python 3.11+
